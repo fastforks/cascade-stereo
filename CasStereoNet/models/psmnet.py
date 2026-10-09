@@ -303,7 +303,7 @@ class GetCostVolume(nn.Module):
         grid = torch.stack([coords_x, coords_y], dim=4)   #(B, D, H, W, 2)
 
         cost[:, x.size()[1]:, :, :, :] = F.grid_sample(y, grid.view(bs, ndisp * height, width, 2), mode='bilinear',
-                                                       padding_mode='zeros').view(bs, channels, ndisp, height, width)
+                                                       padding_mode='zeros', align_corners=True).view(bs, channels, ndisp, height, width)
 
         # a littel difference, no zeros filling
         tmp = x.unsqueeze(2).repeat(1, 1, ndisp, 1, 1) #(B, C, D, H, W)
