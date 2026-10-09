@@ -281,7 +281,7 @@ class GetCostVolume(nn.Module):
         grid = torch.stack([coords_x, coords_y], dim=4) #(B, D, H, W, 2)
 
         y_warped = F.grid_sample(y, grid.view(bs, ndisp * height, width, 2), mode='bilinear',
-                               padding_mode='zeros').view(bs, channels, ndisp, height, width)  #(B, C, D, H, W)
+                               padding_mode='zeros', align_corners=True).view(bs, channels, ndisp, height, width)  #(B, C, D, H, W)
 
 
         # a littel difference, no zeros filling
