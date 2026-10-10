@@ -392,8 +392,14 @@ class GwcNet(nn.Module):
 
     def forward(self, left, right):
 
-        refimg_msfea = self.feature_extraction(left)
-        targetimg_msfea = self.feature_extraction(right)
+        use_amp = getattr(self, "use_amp", False)
+        cv_scale = getattr(self, "cv_scale", 1.0)
+        # left and right through the feature extractor in one batch (BN in eval mode is per sample)
+        with torch.autocast("cuda", enabled=use_amp):
+            msfea = self.feature_extraction(torch.cat([left, right], 0))
+        B = left.shape[0]
+        refimg_msfea = {k: _split(v, 0, B) for k, v in msfea.items()}
+        targetimg_msfea = {k: _split(v, B, 2 * B) for k, v in msfea.items()}
 
         outputs = {}
         pred, cur_disp = None, None
@@ -418,8 +424,8 @@ class GwcNet(nn.Module):
             refimg_fea, targetimg_fea = refimg_msfea["stage{}".format(stage_idx + 1)], \
                                         targetimg_msfea["stage{}".format(stage_idx + 1)]
 
-            # matching
-            cost = self.get_cv(refimg_fea, targetimg_fea,
+            # matching (fp32 volume, stored scaled by cv_scale; see prepare_half)
+            cost = self.get_cv(_float(refimg_fea), _float(targetimg_fea),
                                disp_range_samples=F.interpolate((disp_range_samples / stage_scale).unsqueeze(1),
                                                                 [self.ndisps[stage_idx]//int(stage_scale), left.size()[2]//int(stage_scale), left.size()[3]//int(stage_scale)],
                                                                 mode='trilinear',
@@ -444,11 +450,15 @@ class GwcNet(nn.Module):
                 outputs.update(outputs_stage)
 
             else:
-                pred3 = self.cost_agg[stage_idx](cost,
-                                                 FineD=self.ndisps[stage_idx],
-                                                 FineH=left.shape[2],
-                                                 FineW=left.shape[3],
-                                                 disp_range_samples=disp_range_samples)
+                if use_amp:  # scaled fp32 volume -> fp16 once (the 3D convs run in fp16 anyway)
+                    cost = cost.mul_(cv_scale).half()
+                with torch.autocast("cuda", enabled=use_amp):
+                    pred3 = self.cost_agg[stage_idx](cost,
+                                                     FineD=self.ndisps[stage_idx],
+                                                     FineH=left.shape[2],
+                                                     FineW=left.shape[3],
+                                                     disp_range_samples=disp_range_samples)
+                pred3 = pred3.float()
                 pred = pred3
                 outputs_stage = {
                     "pred3": pred3,
@@ -458,3 +468,27 @@ class GwcNet(nn.Module):
         return outputs
 
 
+
+
+def _split(v, a, b):
+    return {k: x[a:b] for k, x in v.items()} if isinstance(v, dict) else v[a:b]
+
+
+def _float(v):
+    return {k: x.float().contiguous() for k, x in v.items()} if isinstance(v, dict) else v.float().contiguous()
+
+
+def prepare_half(model, cv_scale=1.0 / 16):
+    """Inference in fp16 (autocast) for the feature extractor and the 3D cost aggregation. Cost volumes are built in
+    fp32 and stored scaled by cv_scale (Cas-GwcNet-gc stage-2 group correlations reach ~6e4, beyond fp16); the scale is
+    folded exactly into the BatchNorm right after the first 3D conv (conv is linear: BN(conv(v * s)) with running
+    mean * s, var * s^2, eps * s^2 == BN(conv(v))). Plain PyTorch, ONNX/TensorRT-exportable."""
+    model.eval()
+    for agg in model.cost_agg:
+        bn = agg.dres0[0][1]
+        bn.running_mean.mul_(cv_scale)
+        bn.running_var.mul_(cv_scale ** 2)
+        bn.eps = bn.eps * cv_scale ** 2
+    model.cv_scale = cv_scale
+    model.use_amp = True
+    return model
