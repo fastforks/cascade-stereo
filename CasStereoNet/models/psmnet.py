@@ -233,6 +233,20 @@ class CostAggregation(nn.Module):
 
     def forward(self, cost, FineD, FineH, FineW, disp_range_samples):
 
+        if isinstance(cost, list):  # [volume] handed over by the caller (so that it can be freed here)
+            cost = cost.pop()
+        if not self.training:  # inference: drop each hourglass input as soon as it is consumed (peak memory)
+            x = self.dres0(cost)
+            del cost
+            x = self.dres1(x) + x
+            x = self.dres2(x)
+            x = self.dres3(x)
+            x = self.dres4(x)
+            cost3 = self.classif3(x)
+            del x
+            if not Align_Corners:  # row blocks, no full-resolution cost / probability volume
+                return upsample_softmax_regress(cost3, FineD, FineH, FineW, disp_range_samples)
+
         cost0 = self.dres0(cost)
         cost0 = self.dres1(cost0) + cost0
 
@@ -284,6 +298,22 @@ class CostAggregation(nn.Module):
 class GetCostVolume(nn.Module):
     def __init__(self):
         super(GetCostVolume, self).__init__()
+
+    def forward_planes(self, x, y, disp_range_samples, ndisp, scale=1.0, dtype=torch.float32):
+        """Same volume as forward() ([x, y warped], x not zeroed), one disparity plane at a time (fp32 math per plane,
+        stored as dtype, times scale): no fp32 [B, 2C, D, H, W] volume + warped copy before the cast."""
+        bs, channels, height, width = x.shape
+        vol = x.new_empty((bs, 2 * channels, ndisp, height, width), dtype=dtype)
+        mh, mw = torch.meshgrid([torch.arange(0, height, dtype=x.dtype, device=x.device),
+                                 torch.arange(0, width, dtype=x.dtype, device=x.device)], indexing="ij")
+        coords_y = (mh / ((height - 1.0) / 2.0) - 1.0).expand(bs, height, width)
+        xs = (x * scale).to(dtype)
+        for d in range(ndisp):
+            coords_x = (mw - disp_range_samples[:, d]) / ((width - 1.0) / 2.0) - 1.0
+            grid = torch.stack([coords_x, coords_y], dim=3)
+            vol[:, :channels, d] = xs
+            vol[:, channels:, d] = F.grid_sample(y, grid, mode='bilinear', padding_mode='zeros', align_corners=True) * scale
+        return vol
 
     def forward(self, x, y, disp_range_samples, ndisp):
         assert (x.is_contiguous() == True)
@@ -404,7 +434,9 @@ class PSMNet(nn.Module):
             refimg_fea, targetimg_fea = refimg_msfea["stage{}".format(stage_idx + 1)], \
                                         targetimg_msfea["stage{}".format(stage_idx + 1)]
             # matching (fp32 volume, stored scaled by cv_scale; see prepare_half)
-            cost = self.get_cv(_float(refimg_fea), _float(targetimg_fea),
+            get_cv = self.get_cv if self.training else (lambda *a, **k: self.get_cv.forward_planes(
+                *a, **k, scale=cv_scale, dtype=torch.float16 if use_amp else torch.float32))
+            cost = get_cv(_float(refimg_fea), _float(targetimg_fea),
                                disp_range_samples=F.interpolate((disp_range_samples / stage_scale).unsqueeze(1),
                                                                 [self.ndisps[stage_idx]//int(stage_scale), left.size()[2]//int(stage_scale), left.size()[3]//int(stage_scale)],
                                                                 mode='trilinear',
@@ -427,8 +459,7 @@ class PSMNet(nn.Module):
                 outputs.update(outputs_stage)
 
             else:
-                if use_amp:  # scaled fp32 volume -> fp16 once (the 3D convs run in fp16 anyway)
-                    cost = cost.mul_(cv_scale).half()
+                cost = [cost]  # hand the only reference to cost_agg (freed after its first conv)
                 with torch.autocast("cuda", enabled=use_amp):
                     pred3 = self.cost_agg[stage_idx](cost,
                                                      FineD=self.ndisps[stage_idx],

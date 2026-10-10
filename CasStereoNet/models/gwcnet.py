@@ -211,6 +211,20 @@ class CostAggregation(nn.Module):
 
     def forward(self, cost, FineD, FineH, FineW, disp_range_samples):
 
+        if isinstance(cost, list):  # [volume] handed over by the caller (so that it can be freed here)
+            cost = cost.pop()
+        if not self.training:  # inference: drop each hourglass input as soon as it is consumed (peak memory)
+            x = self.dres0(cost)
+            del cost
+            x = self.dres1(x) + x
+            x = self.dres2(x)
+            x = self.dres3(x)
+            x = self.dres4(x)
+            cost3 = self.classif3(x)
+            del x
+            if not Align_Corners:  # row blocks, no full-resolution cost / probability volume
+                return upsample_softmax_regress(cost3, FineD, FineH, FineW, disp_range_samples)
+
         cost0 = self.dres0(cost)
         cost0 = self.dres1(cost0) + cost0
 
@@ -476,6 +490,7 @@ class GwcNet(nn.Module):
                 outputs.update(outputs_stage)
 
             else:
+                cost = [cost]  # hand the only reference to cost_agg (freed after its first conv)
                 with torch.autocast("cuda", enabled=use_amp):
                     pred3 = self.cost_agg[stage_idx](cost,
                                                      FineD=self.ndisps[stage_idx],
