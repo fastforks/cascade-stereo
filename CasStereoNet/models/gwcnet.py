@@ -297,11 +297,8 @@ class GetCostVolume(nn.Module):
         assert (x.is_contiguous() == True)
         bs, channels, height, width = x.size()
 
-        concat_cost = x.new().resize_(bs, channels * 2, ndisp, height, width).zero_()  # (B, 2C, D, H, W)
-
         x_warped, y_warped = self.get_warped_feats(x, y, disp_range_samples, ndisp)
-        concat_cost[:, x.size()[1]:, :, :, :] = y_warped
-        concat_cost[:, :x.size()[1], :, :, :] = x_warped
+        concat_cost = torch.cat([x_warped, y_warped], 1)  # (B, 2C, D, H, W) (no resize_: exportable)
 
         return concat_cost
 
@@ -316,6 +313,31 @@ class GetCostVolume(nn.Module):
         gwc_cost = (x_warped * y_warped).view([bs, num_groups, channels_per_group, ndisp, height, width]).mean(dim=2)  #(B, G, D, H, W)
 
         return gwc_cost
+
+    def forward_planes(self, features_left, features_right, disp_range_samples, ndisp, num_groups, scale=1.0,
+                       dtype=torch.float32):
+        """Same volume as forward(), built one disparity plane at a time (fp32 math per plane, stored as dtype, times
+        scale): no [B, C, D, H, W] warped-feature tensors (stage 2 of Cas-GwcNet-gc: 3 x 2.9 GB at Middlebury-H)."""
+        xg, yg = features_left["gwc_feature"], features_right["gwc_feature"]
+        xc, yc = features_left["concat_feature"], features_right["concat_feature"]
+        bs, cg, height, width = xg.shape
+        cc = xc.shape[1]
+        vol = xg.new_empty((bs, num_groups + 2 * cc, ndisp, height, width), dtype=dtype)
+        mh, mw = torch.meshgrid([torch.arange(0, height, dtype=xg.dtype, device=xg.device),
+                                 torch.arange(0, width, dtype=xg.dtype, device=xg.device)], indexing="ij")
+        coords_y = (mh / ((height - 1.0) / 2.0) - 1.0).expand(bs, height, width)
+        y = torch.cat([yg, yc], 1)
+        for d in range(ndisp):
+            disp = disp_range_samples[:, d]  # [B, H, W]
+            coords_x = (mw - disp) / ((width - 1.0) / 2.0) - 1.0
+            grid = torch.stack([coords_x, coords_y], dim=3)
+            yw = F.grid_sample(y, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+            valid = (mw >= disp).unsqueeze(1).to(xg.dtype)  # x1 = x2 + d >= d
+            gwc = (xg * valid * yw[:, :cg]).view(bs, num_groups, cg // num_groups, height, width).mean(dim=2)
+            vol[:, :num_groups, d] = gwc * scale
+            vol[:, num_groups + cc:, d] = yw[:, cg:] * scale
+            vol[:, num_groups:num_groups + cc, d] = xc * valid * scale
+        return vol
 
     def forward(self, features_left, features_right, disp_range_samples, ndisp, num_groups):
         # bs, channels, height, width = features_left["gwc_feature"].size()
@@ -425,7 +447,9 @@ class GwcNet(nn.Module):
                                         targetimg_msfea["stage{}".format(stage_idx + 1)]
 
             # matching (fp32 volume, stored scaled by cv_scale; see prepare_half)
-            cost = self.get_cv(_float(refimg_fea), _float(targetimg_fea),
+            get_cv = self.get_cv if self.training else (lambda *a, **k: self.get_cv.forward_planes(
+                *a, **k, scale=cv_scale, dtype=torch.float16 if use_amp else torch.float32))
+            cost = get_cv(_float(refimg_fea), _float(targetimg_fea),
                                disp_range_samples=F.interpolate((disp_range_samples / stage_scale).unsqueeze(1),
                                                                 [self.ndisps[stage_idx]//int(stage_scale), left.size()[2]//int(stage_scale), left.size()[3]//int(stage_scale)],
                                                                 mode='trilinear',
@@ -450,8 +474,6 @@ class GwcNet(nn.Module):
                 outputs.update(outputs_stage)
 
             else:
-                if use_amp:  # scaled fp32 volume -> fp16 once (the 3D convs run in fp16 anyway)
-                    cost = cost.mul_(cv_scale).half()
                 with torch.autocast("cuda", enabled=use_amp):
                     pred3 = self.cost_agg[stage_idx](cost,
                                                      FineD=self.ndisps[stage_idx],

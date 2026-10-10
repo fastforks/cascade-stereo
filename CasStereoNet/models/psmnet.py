@@ -287,7 +287,6 @@ class GetCostVolume(nn.Module):
         assert (x.is_contiguous() == True)
 
         bs, channels, height, width = x.size()
-        cost = x.new().resize_(bs, channels * 2, ndisp, height, width).zero_()
         # cost = y.unsqueeze(2).repeat(1, 2, ndisp, 1, 1) #(B, 2C, D, H, W)
 
         mh, mw = torch.meshgrid([torch.arange(0, height, dtype=x.dtype, device=x.device),
@@ -302,16 +301,16 @@ class GetCostVolume(nn.Module):
         coords_y = cur_disp_coords_y / ((height - 1.0) / 2.0) - 1.0
         grid = torch.stack([coords_x, coords_y], dim=4)   #(B, D, H, W, 2)
 
-        cost[:, x.size()[1]:, :, :, :] = F.grid_sample(y, grid.view(bs, ndisp * height, width, 2), mode='bilinear',
-                                                       padding_mode='zeros', align_corners=True).view(bs, channels, ndisp, height, width)
+        y_warped = F.grid_sample(y, grid.view(bs, ndisp * height, width, 2), mode='bilinear',
+                                 padding_mode='zeros', align_corners=True).view(bs, channels, ndisp, height, width)
 
         # a littel difference, no zeros filling
-        tmp = x.unsqueeze(2).repeat(1, 1, ndisp, 1, 1) #(B, C, D, H, W)
+        tmp = x.unsqueeze(2).expand(-1, -1, ndisp, -1, -1) #(B, C, D, H, W)
         # tmp = tmp.transpose(0, 1) #(C, B, D, H, W)
         # #x1 = x2 + d >= d
         # tmp[:, mw < disp_range_samples] = 0
         # tmp = tmp.transpose(0, 1) #(B, C, D, H, W)
-        cost[:, :x.size()[1], :, :, :] = tmp
+        cost = torch.cat([tmp, y_warped], 1)  # (no resize_: exportable)
 
         return cost
 
