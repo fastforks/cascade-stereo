@@ -244,6 +244,8 @@ class CostAggregation(nn.Module):
             pred2 = F.softmax(cost2, dim=1)
             pred2 = disparity_regression(pred2, disp_range_samples)
 
+        if not self.training and not Align_Corners:  # row blocks, no full-resolution cost / probability volume
+            return upsample_softmax_regress(cost3, FineD, FineH, FineW, disp_range_samples)
         cost3 = F.upsample(cost3, [FineD, FineH, FineW], mode='trilinear', align_corners=Align_Corners)
         cost3 = torch.squeeze(cost3, 1)
         pred3_prob = F.softmax(cost3, dim=1)
@@ -514,3 +516,23 @@ def prepare_half(model, cv_scale=1.0 / 16):
     model.cv_scale = cv_scale
     model.use_amp = True
     return model
+
+
+def upsample_softmax_regress(cost, D, H, W, dv, rows=64):
+    """Inference: cost [B, 1, d, h, w] -> fp32 [B, H, W] = sum(softmax(trilinear(cost -> [D, H, W]), 1) * dv), computed in
+    blocks of output rows (each block upsamples only the low-res rows it needs, +1 halo) -> no full-resolution cost /
+    probability volumes. Same values as the full computation (integer scale factors, align_corners=False)."""
+    B, _, d, h, w = cost.shape
+    sd, sh, sw = D // d, H // h, W // w
+    assert sd * d == D and sh * h == H and sw * w == W
+    out = []
+    for y0 in range(0, H, rows):
+        y1 = min(H, y0 + rows)
+        i0 = max(0, math.floor((y0 + 0.5) / sh - 0.5) - 1)
+        i1 = min(h, math.floor((y1 - 0.5) / sh - 0.5) + 2)
+        up = F.interpolate(cost[:, :, :, i0:i1].float(), scale_factor=(sd, sh, sw), mode="trilinear", align_corners=False,
+                           recompute_scale_factor=False).squeeze(1)
+        a = y0 - i0 * sh
+        p = F.softmax(up[:, :, a:a + (y1 - y0)], dim=1)
+        out.append(torch.sum(p * dv[:, :, y0:y1], 1))
+    return torch.cat(out, 1)
