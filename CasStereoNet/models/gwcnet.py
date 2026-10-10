@@ -151,8 +151,10 @@ class feature_extraction(nn.Module):
                 output_msfeat["stage3"] = {"gwc_feature": out, "concat_feature": out_cat}
 
             elif self.num_stage == 2:
-                intra_feat = F.interpolate(intra_feat, scale_factor=2, mode="nearest") + self.inner1(output_s2)
+                intra_feat = F.interpolate(intra_feat, scale_factor=2, mode="nearest")
+                intra_feat += self.inner1(output_s2)  # in place (peak memory at 1/2 resolution)
                 out = self.out2(intra_feat)
+                del intra_feat
                 out_cat = self.out2_cat(out)
                 output_msfeat["stage2"] =  {"gwc_feature": out, "concat_feature": out_cat}
 
@@ -432,12 +434,10 @@ class GwcNet(nn.Module):
 
         use_amp = getattr(self, "use_amp", False)
         cv_scale = getattr(self, "cv_scale", 1.0)
-        # left and right through the feature extractor in one batch (BN in eval mode is per sample)
+        # left and right one after the other (as upstream; a batch of both doubles the full-resolution peak memory)
         with torch.autocast("cuda", enabled=use_amp):
-            msfea = self.feature_extraction(torch.cat([left, right], 0))
-        B = left.shape[0]
-        refimg_msfea = {k: _split(v, 0, B) for k, v in msfea.items()}
-        targetimg_msfea = {k: _split(v, B, 2 * B) for k, v in msfea.items()}
+            refimg_msfea = self.feature_extraction(left)
+            targetimg_msfea = self.feature_extraction(right)
 
         outputs = {}
         pred, cur_disp = None, None
@@ -507,10 +507,6 @@ class GwcNet(nn.Module):
         return outputs
 
 
-
-
-def _split(v, a, b):
-    return {k: x[a:b] for k, x in v.items()} if isinstance(v, dict) else v[a:b]
 
 
 def _float(v):

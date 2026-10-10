@@ -406,12 +406,10 @@ class PSMNet(nn.Module):
 
         use_amp = getattr(self, "use_amp", False)
         cv_scale = getattr(self, "cv_scale", 1.0)
-        # left and right through the feature extractor in one batch (BN in eval mode is per sample)
+        # left and right one after the other (as upstream; a batch of both doubles the full-resolution peak memory)
         with torch.autocast("cuda", enabled=use_amp):
-            msfea = self.feature_extraction(torch.cat([left, right], 0))
-        B = left.shape[0]
-        refimg_msfea = {k: _split(v, 0, B) for k, v in msfea.items()}
-        targetimg_msfea = {k: _split(v, B, 2 * B) for k, v in msfea.items()}
+            refimg_msfea = self.feature_extraction(left)
+            targetimg_msfea = self.feature_extraction(right)
 
         outputs = {}
         pred, cur_disp = None, None
@@ -474,10 +472,6 @@ class PSMNet(nn.Module):
                 outputs["stage{}".format(stage_idx + 1)] = outputs_stage
 
         return outputs
-
-
-def _split(v, a, b):
-    return {k: x[a:b] for k, x in v.items()} if isinstance(v, dict) else v[a:b]
 
 
 def _float(v):
