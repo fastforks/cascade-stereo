@@ -1,6 +1,6 @@
 # Cascade-Stereo (CasStereoNet): faster inference fork
 
-> **You are on `portable`.** Research fork of [alibaba/cascade-stereo](https://github.com/alibaba/cascade-stereo) (base `2ae7da6`, 2022-12-24; `main` mirrors upstream). Two branches:
+> **You are on `cuda-kernels`.** Research fork of [alibaba/cascade-stereo](https://github.com/alibaba/cascade-stereo) (base `2ae7da6`, 2022-12-24; `main` mirrors upstream). Two branches:
 > - [`portable`](https://github.com/fastforks/cascade-stereo/tree/portable): plain PyTorch, exports to ONNX / TensorRT, no build step.
 > - [`cuda-kernels`](https://github.com/fastforks/cascade-stereo/tree/cuda-kernels): `portable` plus custom CUDA kernels (prebuilt for sm_80/86/89/90/120 + PTX; without a matching prebuilt they are JIT-compiled with the `nvcc` of `CUDA_HOME`; fp16-accumulate convs need `pip install nvidia-cudnn-frontend`).
 >
@@ -27,8 +27,8 @@ Cas-GwcNet-gc (`--model gwcnet`):
 
 ```python
 # cwd CasStereoNet/; model = __models__["gwcnet-c" | "gwcnet"](...) with the checkpoint loaded, .cuda().eval()
-from models.gwcnet import prepare_half
-prepare_half(model)                      # portable: fp16 autocast, fp32 cost volume
+from cuda_inference import prepare
+prepare(model)                           # cuda-kernels: fp16 convs, fused BN epilogues
 pred = model(left, right)["stage2"]["pred"]  # ImageNet-normalised images padded to /32, as upstream
 ```
 
